@@ -10,3 +10,7 @@ pydantic
 jinja2
 fastapi
 uvicorn
+fastapi-middleware
+botbuilder-core
+botbuilder-schema
+aiohttp
