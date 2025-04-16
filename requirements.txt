@@ -1,0 +1,12 @@
+streamlit
+google-generativeai
+pymongo
+requests
+python-dotenv
+pandas
+dnspython
+jira
+pydantic
+jinja2
+fastapi
+uvicorn
