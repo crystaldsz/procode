@@ -18,8 +18,10 @@ from botbuilder.core import (
     MessageFactory,
     ConversationState,
     UserState,
-    MemoryStorage # Use MemoryStorage for simple testing, replace for production
+    # MemoryStorage # Replaced with FileStorage for persistent local testing
 )
+# ADDED: FileStorage for persistent local testing state
+from botbuilder.core.storage import FileStorage
 from botbuilder.schema import (
     Activity,
     ActivityTypes,
@@ -38,7 +40,13 @@ from botbuilder.core.teams import TeamsActivityHandler, TeamsInfo
 # Placeholder function for getting boards
 async def get_boards_placeholder(credentials: Dict[str, str]) -> List[Dict[str, Any]]:
     """Placeholder: Simulates fetching Jira boards."""
-    logger.info(f"Simulating fetching boards with creds: {credentials.get('JIRA_EMAIL')}")
+    # Simulate checking credentials - replace with actual validation if needed
+    if not credentials or not credentials.get("JIRA_URL") or not credentials.get("JIRA_EMAIL") or not credentials.get("JIRA_API_TOKEN"):
+        logger.warning("get_boards_placeholder called with incomplete credentials.")
+        # Optionally raise an error or return empty list based on desired handling
+        # raise ValueError("Incomplete Jira credentials provided.")
+        return []
+    logger.info(f"Simulating fetching boards with creds for email: {credentials.get('JIRA_EMAIL')}")
     await asyncio.sleep(0.5) # Simulate network delay
     # In a real scenario, use credentials to make an API call to Jira
     return [{"id": "10001", "name": "Project Alpha Board"}, {"id": "10002", "name": "Team Phoenix Sprint Board"}]
@@ -46,6 +54,9 @@ async def get_boards_placeholder(credentials: Dict[str, str]) -> List[Dict[str, 
 # Placeholder function for getting team members (replace with actual logic)
 async def get_team_members_placeholder(board_id: str, credentials: Dict[str, str]) -> List[str]:
     """Placeholder: Simulates fetching team members for a board."""
+    if not credentials: # Add basic check
+        logger.warning("get_team_members_placeholder called without credentials.")
+        return []
     logger.info(f"Simulating fetching members for board {board_id}")
     await asyncio.sleep(0.2)
     # In a real scenario, query Jira based on board/project settings
@@ -89,22 +100,34 @@ app = FastAPI(title="AI Scrum Bot for Teams", description="Handles standup inter
 MICROSOFT_APP_ID = os.getenv("MICROSOFT_APP_ID")
 MICROSOFT_APP_PASSWORD = os.getenv("MICROSOFT_APP_PASSWORD")
 
+# Log whether credentials are found (useful for debugging auth issues)
 if not MICROSOFT_APP_ID or not MICROSOFT_APP_PASSWORD:
-    logger.error("FATAL ERROR: Microsoft App ID or Password not found in environment variables.")
-    # You might want to exit or raise an exception here in a real deployment
-    # For now, we'll let it potentially fail later during adapter use.
+    logger.warning("Microsoft App ID or Password not found in environment variables. Adapter will run without authentication checks (OK for Emulator testing without credentials).")
+else:
+    logger.info("Microsoft App ID and Password loaded from environment variables.")
+
 
 SETTINGS = BotFrameworkAdapterSettings(MICROSOFT_APP_ID, MICROSOFT_APP_PASSWORD)
 ADAPTER = BotFrameworkAdapter(SETTINGS)
 
 # --- State Management ---
-# Use MemoryStorage for development/testing. Replace with CosmosDbPartitionedStorage, BlobStorage, etc., for production.
-MEMORY_STORAGE = MemoryStorage()
+# Use FileStorage for simple local persistence during testing across restarts
+# REMEMBER: Add 'bot_state.json' to your .gitignore file!
+try:
+    STORAGE = FileStorage("bot_state.json") # Creates/uses a file to store state
+    logger.info("Using FileStorage for state persistence (bot_state.json)")
+except Exception as e:
+    # Fallback if FileStorage fails (e.g., permissions issue)
+    logger.error(f"Failed to initialize FileStorage, falling back to MemoryStorage: {e}")
+    from botbuilder.core import MemoryStorage
+    STORAGE = MemoryStorage()
+    logger.warning("Using MemoryStorage for state due to FileStorage error.")
+
 # ConversationState stores data related to the conversation (e.g., current standup state)
-CONVERSATION_STATE = ConversationState(MEMORY_STORAGE)
+CONVERSATION_STATE = ConversationState(STORAGE)
 # UserState stores data related to the user (e.g., their Jira credentials - use securely!)
-# Note: Storing secrets like API tokens directly in bot state is risky. Consider more secure methods like Azure Key Vault or user-specific secure storage.
-USER_STATE = UserState(MEMORY_STORAGE)
+# Note: Storing secrets like API tokens directly in bot state is risky. Consider more secure methods.
+USER_STATE = UserState(STORAGE)
 
 # Create property accessors for easy state access
 conversation_data_accessor = CONVERSATION_STATE.create_property("ConversationData")
@@ -123,42 +146,42 @@ class ScrumBot(TeamsActivityHandler): # Inherit from TeamsActivityHandler for Te
         # Override on_turn to load/save state automatically
         await super().on_turn(turn_context)
         # Save any state changes after the turn is processed
-        await self.conversation_state.save_changes(turn_context, False)
-        await self.user_state.save_changes(turn_context, False)
+        # Use run_backgroundtasks=True for potentially better performance but less predictable save timing
+        await self.conversation_state.save_changes(turn_context, force=False)
+        await self.user_state.save_changes(turn_context, force=False)
+        logger.debug("State changes saved.") # Add debug log for state saving
 
     async def on_message_activity(self, turn_context: TurnContext):
         """Handles incoming message activities."""
         # Get conversation state (initialize if first time)
-        # Default dict helps avoid KeyError if properties don't exist yet
         conv_data = await self.conversation_data_accessor.get(turn_context, lambda: {"standup_active": False, "current_member_index": -1, "team_members": [], "member_answers": {}, "current_step": {}})
         # Get user profile state (initialize if first time)
         user_profile = await self.user_profile_accessor.get(turn_context, lambda: {"credentials": None, "board_id": None})
 
+        # ADDED: Log state at the beginning of the turn for debugging
+        logger.info(f"START Turn - User: {turn_context.activity.from_property.id}, Conv: {turn_context.activity.conversation.id}")
+        logger.info(f"START Turn - Conv Data: {json.dumps(conv_data)}") # Dump state for clarity
+        logger.info(f"START Turn - User Profile: {json.dumps(user_profile)}") # Dump state for clarity
+
+
         # IMPORTANT: Remove bot mention text from the message
-        # This prevents the bot's name from being processed as part of the command/response
         cleaned_text = TurnContext.remove_recipient_mention(turn_context.activity)
         text = cleaned_text.strip().lower() if cleaned_text else ""
 
         # Check if the message is from a group chat and if the bot was mentioned
-        # In 1:1 chats, mentions are not usually needed/present.
-        # In group chats, usually respond only when mentioned.
         mentioned = False
         if turn_context.activity.conversation.is_group:
              mentions = turn_context.activity.get_mentions()
-             for mention in mentions:
-                 # Check if the mention's ID matches the bot's ID
-                 if mention.mentioned.id == turn_context.activity.recipient.id:
-                     mentioned = True
-                     break
-             if not mentioned:
+             bot_mentioned_in_group = any(m.mentioned.id == turn_context.activity.recipient.id for m in mentions)
+
+             if not bot_mentioned_in_group:
                  logger.info("Bot not mentioned in group chat, ignoring message.")
                  return # Don't respond if not mentioned in a group chat
+             else:
+                 mentioned = True # Explicitly set for clarity if needed later
 
-        logger.info(f"📩 Received message: '{turn_context.activity.text}' (Processed as: '{text}')")
-        logger.info(f"Conversation ID: {turn_context.activity.conversation.id}")
-        logger.info(f"User ID: {turn_context.activity.from_property.id}")
-        logger.info(f"Current conv_data: {conv_data}")
-        logger.info(f"Current user_profile: {user_profile}")
+        logger.info(f"📩 Received message: '{turn_context.activity.text}' (Is Group: {turn_context.activity.conversation.is_group}, Mentioned: {mentioned}, Processed Text: '{text}')")
+        # Basic info logged previously, adding more detail here
 
         response_text = "Sorry, I didn't understand that. Type 'help' for commands." # Default response
 
@@ -182,93 +205,126 @@ class ScrumBot(TeamsActivityHandler): # Inherit from TeamsActivityHandler for Te
              # Initiate credential setting - ask for URL first
             conv_data["next_credential_step"] = "url" # Track expected input
             response_text = "Okay, please provide your Jira URL (e.g., https://your-domain.atlassian.net):"
+            logger.info("Command 'set credentials': Setting next_credential_step=url") # ADDED Log
 
         elif conv_data.get("next_credential_step") == "url":
-            user_profile["credentials"] = {"JIRA_URL": text}
-            conv_data["next_credential_step"] = "email"
-            response_text = "Got the URL. Now, please provide your Jira Email:"
+            logger.info(f"Processing step 'url', received text: {text}") # ADDED Log
+            # Basic validation example (can be more robust)
+            if not text.startswith("http://") and not text.startswith("https://"):
+                response_text = "Invalid URL format. Please include http:// or https://."
+                # Keep expecting url
+                logger.warning("Invalid URL format provided for Jira URL.")
+            else:
+                user_profile["credentials"] = {"JIRA_URL": text}
+                conv_data["next_credential_step"] = "email"
+                response_text = "Got the URL. Now, please provide your Jira Email:"
+                logger.info("Step 'url' processed. Setting next_credential_step=email") # ADDED Log
 
         elif conv_data.get("next_credential_step") == "email":
+            logger.info(f"Processing step 'email', received text: {text}") # ADDED Log
             if user_profile.get("credentials"):
-                user_profile["credentials"]["JIRA_EMAIL"] = text
-                conv_data["next_credential_step"] = "token"
-                response_text = "Got the Email. Now, please provide your Jira API Token:"
+                 # Basic email validation example
+                if "@" not in text or "." not in text:
+                     response_text = "Invalid email format. Please provide a valid email address."
+                     # Keep expecting email
+                     logger.warning("Invalid email format provided for Jira Email.")
+                else:
+                    user_profile["credentials"]["JIRA_EMAIL"] = text
+                    conv_data["next_credential_step"] = "token"
+                    response_text = "Got the Email. Now, please provide your Jira API Token:"
+                    logger.info("Step 'email' processed. Setting next_credential_step=token") # ADDED Log
             else:
                 response_text = "Please start with `set credentials` first."
+                logger.warning("Credential step 'email' but no credentials found in profile. Resetting step.") # ADDED Log
                 conv_data.pop("next_credential_step", None) # Reset step tracking
 
         elif conv_data.get("next_credential_step") == "token":
+            logger.info("Processing step 'token', received text: [REDACTED]") # ADDED Log - Avoid logging tokens
             if user_profile.get("credentials"):
-                user_profile["credentials"]["JIRA_API_TOKEN"] = text # Store securely in production!
-                conv_data.pop("next_credential_step", None) # Clear tracking
-                logger.info(f"Credentials set for user {turn_context.activity.from_property.id}")
-                response_text = "✅ Credentials saved! You can now use `select board`."
+                 # Basic token validation (check if not empty)
+                if not text:
+                    response_text = "API Token cannot be empty. Please provide your Jira API Token:"
+                    # Keep expecting token
+                    logger.warning("Empty API token provided.")
+                else:
+                    user_profile["credentials"]["JIRA_API_TOKEN"] = text # Store securely in production!
+                    conv_data.pop("next_credential_step", None) # Clear tracking
+                    logger.info(f"Credentials set for user {turn_context.activity.from_property.id}. Cleared next_credential_step.") # ADDED Log
+                    response_text = "✅ Credentials saved! You can now use `select board`."
             else:
                 response_text = "Please start with `set credentials` first."
+                logger.warning("Credential step 'token' but no credentials found in profile. Resetting step.") # ADDED Log
                 conv_data.pop("next_credential_step", None)
 
         elif text == "select board":
             if not user_profile.get("credentials"):
                 response_text = "Please set your Jira credentials first using `set credentials`."
             else:
+                logger.info("Command 'select board': Attempting to fetch boards.") # ADDED Log
                 try:
                     boards = await get_boards_placeholder(user_profile["credentials"])
                     if not boards:
                         response_text = "Could not find any Jira boards associated with your account. Please check your credentials and permissions."
+                        logger.warning("No boards found for the user's credentials.")
                     else:
                         board_options = "\n".join([f"• `{board['id']}`: {board.get('name', 'Unknown Name')}" for board in boards])
                         response_text = f"Found these boards:\n{board_options}\n\nPlease reply with the board ID you want to use (e.g., `use board 10001`)."
                         conv_data["expecting_board_id"] = True
+                        logger.info(f"Boards fetched successfully. Setting expecting_board_id=True") # ADDED Log
                 except Exception as e:
-                    logger.error(f"Error fetching boards: {e}")
+                    logger.error(f"Error fetching boards: {e}", exc_info=True) # Log traceback
                     response_text = "Sorry, I encountered an error trying to fetch your Jira boards."
 
         elif text.startswith("use board ") and conv_data.get("expecting_board_id"):
+            logger.info(f"Processing 'use board', received text: {text}") # ADDED Log
             try:
                 board_id = text.split("use board ")[1].strip()
-                # You might want to add validation here to check if it's one of the listed IDs
+                if not board_id: # Check if ID is empty after split
+                     raise IndexError("Board ID cannot be empty.")
+                # You might want to add validation here to check if it's one of the listed IDs from get_boards
                 user_profile["board_id"] = board_id
                 conv_data.pop("expecting_board_id", None)
                 response_text = f"✅ Board `{board_id}` selected. You can now `start standup`."
-                logger.info(f"User {turn_context.activity.from_property.id} selected board {board_id}")
+                logger.info(f"User {turn_context.activity.from_property.id} selected board {board_id}. Cleared expecting_board_id.") # ADDED Log
             except IndexError:
-                 response_text = "Invalid format. Please use `use board <board_id>`."
+                 response_text = "Invalid format or empty ID. Please use `use board <board_id>`."
+                 logger.warning(f"Invalid 'use board' format or empty ID: {text}") # ADDED Log
 
         elif text == "start standup":
             if not user_profile.get("board_id"):
                 response_text = "Please select a board first using `select board`."
+            elif not user_profile.get("credentials"): # Add check for credentials too
+                 response_text = "Please set your Jira credentials first using `set credentials`."
             elif conv_data.get("standup_active"):
                 response_text = "A standup is already in progress. Use `status` to see who's next."
             else:
+                logger.info("Command 'start standup': Attempting to start.") # ADDED Log
                 try:
-                    # Fetch team members for the selected board
-                    # Pass credentials securely if needed by the real function
                     team_members = await get_team_members_placeholder(user_profile["board_id"], user_profile["credentials"])
                     if not team_members:
                          response_text = f"No team members found for board `{user_profile['board_id']}`. Cannot start standup."
+                         logger.warning(f"No team members found for board {user_profile['board_id']}.")
                     else:
                         conv_data["standup_active"] = True
                         conv_data["team_members"] = team_members
                         conv_data["current_member_index"] = 0
                         conv_data["member_answers"] = {member: {} for member in team_members} # Init answers dict
                         conv_data["current_step"] = {member: 1 for member in team_members} # Init steps dict
-                        
+
                         first_member = conv_data["team_members"][0]
                         current_step_for_member = conv_data["current_step"][first_member]
-                        
+
                         response_text = f"🚀 Standup started for board `{user_profile['board_id']}` with members: {', '.join(team_members)}.\n\nLet's begin with {first_member}!"
-                        # Ask the first question immediately after starting
                         question = generate_question_placeholder(first_member, current_step_for_member, self.standup_questions_total)
 
                         # Send the start message first, then the question
                         await turn_context.send_activity(MessageFactory.text(response_text))
-                        # Send the question (this will be the actual response for this turn)
-                        response_text = question
+                        response_text = question # The final response for this turn will be the first question
 
-                        logger.info(f"Standup started. Asking {first_member}, step {current_step_for_member}.")
+                        logger.info(f"Standup started. Asking {first_member}, step {current_step_for_member}.") # Refined Log
 
                 except Exception as e:
-                    logger.error(f"Error starting standup: {e}")
+                    logger.error(f"Error starting standup: {e}", exc_info=True) # Log traceback
                     response_text = "Sorry, I encountered an error trying to start the standup."
                     # Reset potentially inconsistent state
                     conv_data["standup_active"] = False
@@ -282,13 +338,15 @@ class ScrumBot(TeamsActivityHandler): # Inherit from TeamsActivityHandler for Te
                 current_member = conv_data["team_members"][current_index]
                 current_step = conv_data["current_step"].get(current_member, 1)
 
-                # Heuristic: Assume any message during an active standup *might* be an answer
-                # More robust: Check if the sender is the person being asked. For now, let's assume it is.
-                # In a group chat, this might be noisy. Ideally, only the mentioned user's reply is processed.
-                # We'll keep it simple: process the text as the answer for the current member/step.
+                # Simplistic check: Assuming the incoming message is the answer from the current member
+                # TODO: Improve this in production (e.g., check turn_context.activity.from_property.id against expected member ID if possible)
+                logger.info(f"Standup active: Processing text as answer from {current_member} for step {current_step}")
 
                 # Process the user's response (placeholder)
                 process_user_response_placeholder(current_member, current_step, text)
+                # Ensure nested dict exists before assignment
+                if current_member not in conv_data["member_answers"]:
+                    conv_data["member_answers"][current_member] = {}
                 conv_data["member_answers"][current_member][current_step] = text # Store the answer
 
                 # Move to the next step for the current member
@@ -319,7 +377,7 @@ class ScrumBot(TeamsActivityHandler): # Inherit from TeamsActivityHandler for Te
                         # Reset standup state
                         conv_data["standup_active"] = False
                         conv_data["current_member_index"] = -1
-                        # Keep answers if needed, or clear them:
+                        # Keep answers/steps for this session, or clear them:
                         # conv_data["member_answers"] = {}
                         # conv_data["current_step"] = {}
 
@@ -339,6 +397,7 @@ class ScrumBot(TeamsActivityHandler): # Inherit from TeamsActivityHandler for Te
                      response_text = "Standup is active, but the current member index seems off."
             else:
                 response_text = f"No standup currently active. Board selected: `{user_profile.get('board_id', 'None')}`. Use `start standup` to begin."
+            logger.info(f"Command 'status': Responded with current status.") # ADDED Log
 
         elif text == "reset":
             # Reset conversation state related to standup
@@ -347,34 +406,25 @@ class ScrumBot(TeamsActivityHandler): # Inherit from TeamsActivityHandler for Te
             conv_data["team_members"] = []
             conv_data["member_answers"] = {}
             conv_data["current_step"] = {}
-            conv_data.pop("next_credential_step", None)
-            conv_data.pop("expecting_board_id", None)
-            # Optionally reset user state too (credentials, board_id)
-            # await self.user_profile_accessor.delete(turn_context) # This deletes the whole profile
-            user_profile["credentials"] = None # Or reset specific parts
-            user_profile["board_id"] = None
-            response_text = "🔄 Standup state and board selection have been reset for this conversation."
-            logger.info("Conversation state reset.")
+            conv_data.pop("next_credential_step", None) # Clear credential step tracking
+            conv_data.pop("expecting_board_id", None) # Clear board selection tracking
 
+            # Reset user state too (credentials, board_id) for this user in this turn
+            user_profile["credentials"] = None
+            user_profile["board_id"] = None
+
+            response_text = "🔄 Standup state, credentials, and board selection have been reset for this conversation."
+            logger.info("Command 'reset': Conversation and relevant user state reset.") # Refined Log
+
+
+        # ADDED: Log state *before* sending response (and before state save in on_turn)
+        logger.info(f"END Turn - Determined Response: '{response_text}'")
+        logger.info(f"END Turn - Conv Data: {json.dumps(conv_data)}") # Dump state for clarity
+        logger.info(f"END Turn - User Profile: {json.dumps(user_profile)}") # Dump state for clarity
 
         # --- Send the response ---
         # Check if we already sent a response (e.g., asking the first question immediately after 'start standup')
         if not turn_context.responded:
-             # Prepare mention if needed within the response text (placeholders do this)
-             # For group chats, mentioning the user you're addressing is good practice.
-             # The generate_question_placeholder includes the @mention.
-             # Example of manually adding mention if needed:
-             # if conv_data.get("standup_active") and ...:
-             #     member_to_mention = ...
-             #     member_account = ChannelAccount(id=...) # Need the Teams User ID
-             #     mention_entity = Mention(mentioned=member_account, text=f"@{member_to_mention}")
-             #     reply_activity = MessageFactory.text(response_text)
-             #     reply_activity.entities = [mention_entity]
-             #     await turn_context.send_activity(reply_activity)
-             # else:
-             #     await turn_context.send_activity(MessageFactory.text(response_text))
-
-             # Simple text reply using the determined response_text
              await turn_context.send_activity(MessageFactory.text(response_text))
 
 
@@ -400,37 +450,34 @@ async def handle_messages(request: Request):
         raise HTTPException(status_code=415, detail="Unsupported Media Type")
 
     body = await request.json()
-    # logger.debug(f"Received raw body: {json.dumps(body, indent=2)}") # Careful logging raw body
+    # logger.debug(f"Received raw body: {json.dumps(body, indent=2)}") # Keep commented unless needed
 
     # Create an Activity object from the incoming request body
     activity = Activity().deserialize(body)
-    # logger.debug(f"Deserialized activity type: {activity.type}")
+    # logger.debug(f"Deserialized activity type: {activity.type}") # Keep commented unless needed
 
     # Get the Authorization header from the request
     auth_header = request.headers.get("Authorization", "")
 
     try:
         # Process the activity using the Bot Framework Adapter.
-        # This handles authentication and directs the activity to the BOT's handler (e.g., on_message_activity)
+        # This handles authentication and directs the activity to the BOT's handler
+        # BOT.on_turn handles calling the right method (on_message_activity, etc.) AND saving state
         response = await ADAPTER.process_activity(activity, auth_header, BOT.on_turn)
 
-        # The adapter's response might contain information for the Bot Framework Service (e.g., invoke responses)
+        # The adapter's response might contain information for the Bot Framework Service
         if response:
-            # Log the response status code if available
             logger.info(f"Adapter process_activity completed with status: {response.status}")
-            # Return the adapter's response content and status code
-            # Important for invoke activities or specific Bot Framework protocols
             return Response(content=response.body, status_code=response.status, media_type="application/json")
         else:
             # If the adapter doesn't return a specific response (common for message activities), return HTTP 202 Accepted
-            # This acknowledges receipt of the message activity. The actual reply is sent asynchronously via turn_context.send_activity.
-            logger.info("Adapter process_activity completed successfully (no specific response needed). Returning 202 Accepted.")
+            logger.info("Adapter process_activity completed successfully (no specific response body needed). Returning 202 Accepted.")
             return Response(status_code=202) # Use 202 Accepted for async message handling
 
     except Exception as e:
-        logger.exception(f"Error processing activity: {e}") # Log the full traceback
+        logger.exception(f"Critical error processing activity: {e}") # Log the full traceback
         # Return an HTTP 500 Internal Server Error if something goes wrong
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal Server Error processing activity") # Avoid sending raw error details
 
 @app.get("/")
 def read_root():
@@ -440,6 +487,8 @@ def read_root():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
-    logger.info(f"Starting FastAPI server on host 0.0.0.0 port {port}")
-    # Use reload=True for development only
-    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info") # Make sure your file is named main.py or adjust here
+    log_level = os.getenv("LOG_LEVEL", "info").lower() # Allow setting log level via env var
+    logger.info(f"Starting FastAPI server on host 0.0.0.0 port {port} with log level {log_level}")
+
+    # Use reload=True for development only. Ensure file is named 'main.py' or adjust "main:app".
+    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level=log_level, reload=True) # Set reload=False for production

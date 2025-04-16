@@ -14,3 +14,5 @@ fastapi-middleware
 aiohttp
 botbuilder-core>=4.14.0
 botbuilder-schema>=4.14.0
+botbuilder-integration-aiohttp  # Crucial for BotBuilder with FastAPI
+botbuilder-core[teams]          # Includes Teams-specific extensions
