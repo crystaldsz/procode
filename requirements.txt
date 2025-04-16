@@ -11,6 +11,6 @@ jinja2
 fastapi
 uvicorn
 fastapi-middleware
-botbuilder-core
-botbuilder-schema
 aiohttp
+botbuilder-core>=4.14.0
+botbuilder-schema>=4.14.0
