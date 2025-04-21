@@ -8,9 +8,13 @@ from pymongo.errors import DuplicateKeyError
 import google.generativeai as genai
 import requests
 from requests.auth import HTTPBasicAuth
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+# Bot Framework imports
+from botbuilder.core import BotFrameworkAdapterSettings, TurnContext, BotFrameworkAdapter
+from botbuilder.schema import Activity, ActivityTypes, ConversationReference
 
 # --------------------------------------------------------------------------------
 # 1) Load environment variables and configure APIs
@@ -34,6 +38,17 @@ jira_headers = {"Accept": "application/json"}
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel('gemini-2.0-flash')
 
+# Bot Framework Configuration
+BOT_APP_ID = os.getenv("MicrosoftAppId", "3a62a6ac-053d-4cb7-8781-4786a695705b")  # Replace with your actual App ID
+BOT_APP_PASSWORD = os.getenv("MicrosoftAppPassword", "")  # Replace with your actual App Password
+
+# Configure Bot Framework adapter
+BOT_SETTINGS = BotFrameworkAdapterSettings(BOT_APP_ID, BOT_APP_PASSWORD)
+BOT_ADAPTER = BotFrameworkAdapter(BOT_SETTINGS)
+
+# Store conversation references
+CONVERSATION_REFERENCES = {}
+
 # --------------------------------------------------------------------------------
 # 2) MongoDB Setup
 # --------------------------------------------------------------------------------
@@ -44,6 +59,7 @@ sprints_collection = db["sprints"]
 issues_collection = db["issues"]
 users_collection = db["users"]
 conversations_collection = db["conversations"]
+teams_users_collection = db["teams_users"]  # New collection for Teams users
 
 # --------------------------------------------------------------------------------
 # 2.1) MongoDB Helper Functions
@@ -107,6 +123,23 @@ def store_user(user_id: str, display_name: str):
         users_collection.insert_one(user_doc)
     except DuplicateKeyError:
         print(f"User with id {user_id} already exists.")
+
+def store_teams_user(teams_user_id: str, name: str, email: str = None):
+    """Store a Microsoft Teams user in MongoDB."""
+    user_doc = {
+        "teams_user_id": teams_user_id,
+        "name": name,
+        "email": email,
+        "created_at": datetime.utcnow()
+    }
+    try:
+        teams_users_collection.update_one(
+            {"teams_user_id": teams_user_id},
+            {"$set": user_doc},
+            upsert=True
+        )
+    except Exception as e:
+        print(f"Error storing Teams user: {e}")
 
 def store_conversation(conversation_doc: dict):
     """Store a conversation document into MongoDB."""
@@ -223,6 +256,7 @@ class AIScrumMaster:
         self.standup_started = False
         self.messages = []
         self.nothing_count = 0
+        self.conversation_reference = None  # For Teams integration
 
         # Initialize with a system prompt
         self.system_prompt = (
@@ -446,7 +480,27 @@ Format the summary in markdown.
             return "Could not generate summary."
 
 # --------------------------------------------------------------------------------
-# 5) FastAPI Routes and Data Models
+# 5) Teams Bot Implementation
+# --------------------------------------------------------------------------------
+def store_conversation_reference(activity: Activity):
+    """Store a conversation reference from an incoming activity."""
+    conversation_reference = TurnContext.get_conversation_reference(activity)
+    CONVERSATION_REFERENCES[conversation_reference.user.id] = conversation_reference
+    return conversation_reference
+
+async def send_proactive_message(conversation_reference: ConversationReference, text: str):
+    """Send a proactive message to a user using a stored conversation reference."""
+    async def send_message(turn_context):
+        await turn_context.send_activity(text)
+    
+    await BOT_ADAPTER.continue_conversation(
+        conversation_reference,
+        send_message,
+        BOT_APP_ID
+    )
+
+# --------------------------------------------------------------------------------
+# 6) FastAPI Routes and Data Models
 # --------------------------------------------------------------------------------
 app = FastAPI()
 
@@ -477,6 +531,145 @@ class StandupState(BaseModel):
 
 standup_sessions: Dict[str, AIScrumMaster] = {}
 
+# Teams Bot webhook endpoint
+@app.post("/api/messages")
+async def messages(req: Request):
+    body = await req.json()
+    activity = Activity().deserialize(body)
+    
+    # Store the conversation reference for later use
+    conversation_reference = store_conversation_reference(activity)
+    
+    async def turn_handler(turn_context: TurnContext):
+        # Only process message activities
+        if turn_context.activity.type == ActivityTypes.message:
+            # Get the message text
+            text = turn_context.activity.text.strip()
+            user_id = turn_context.activity.from_property.id
+            user_name = turn_context.activity.from_property.name
+            
+            # Store the Teams user
+            store_teams_user(user_id, user_name)
+            
+            # Process commands
+            if text.lower().startswith("start standup"):
+                # Extract board ID if provided, otherwise use default
+                parts = text.split()
+                board_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+                
+                # Initialize scrum master
+                scrum_master = AIScrumMaster(user_id)
+                scrum_master.conversation_reference = conversation_reference
+                standup_sessions[user_id] = scrum_master
+                
+                if scrum_master.initialize_sprint_data(board_id):
+                    await turn_context.send_activity(f"Standup started for board {board_id}!")
+                    # Send the first question
+                    if scrum_master.team_members_list:
+                        member = scrum_master.team_members_list[0]
+                        question = scrum_master.generate_question(member, 1)
+                        await turn_context.send_activity(f"📋 **Current Member**: {member}\n\n{question}")
+                    else:
+                        await turn_context.send_activity("No team members found in the current sprint.")
+                else:
+                    await turn_context.send_activity("Could not find an active sprint for this board.")
+            
+            elif text.lower() == "get boards":
+                try:
+                    boards = get_boards()
+                    boards_list = "\n".join([f"- Board ID: {b['id']}, Name: {b['name']}" for b in boards])
+                    await turn_context.send_activity(f"Available boards:\n{boards_list}")
+                except Exception as e:
+                    await turn_context.send_activity(f"Error fetching boards: {str(e)}")
+            
+            elif text.lower() == "get summary":
+                scrum_master = standup_sessions.get(user_id)
+                if scrum_master and scrum_master.standup_started:
+                    summary = scrum_master.generate_summary()
+                    await turn_context.send_activity(f"# Standup Summary\n\n{summary}")
+                    
+                    # Store conversation and clean up
+                    blockers = [msg['content'] for msg in scrum_master.conversation_history 
+                               if "blocker" in msg['content'].lower()]
+                    action_items = [msg['content'] for msg in scrum_master.conversation_history 
+                                   if "action item" in msg['content'].lower()]
+                    conversation_doc = {
+                        "user_id": user_id,
+                        "messages": scrum_master.conversation_history,
+                        "blockers": blockers,
+                        "action_items": action_items,
+                        "summary": summary
+                    }
+                    store_conversation(conversation_doc)
+                    scrum_master.standup_started = False
+                    del standup_sessions[user_id]
+                else:
+                    await turn_context.send_activity("No active standup session found.")
+            
+            elif text.lower() == "help":
+                help_text = """
+# AI Scrum Master Bot Commands
+
+- **start standup [board_id]** - Begin a new standup session
+- **get boards** - List available JIRA boards
+- **get summary** - Generate a summary of the current standup
+- **help** - Show this help message
+
+During a standup, simply respond to the bot's questions normally.
+                """
+                await turn_context.send_activity(help_text)
+            
+            else:
+                # Process as a response to an ongoing standup
+                scrum_master = standup_sessions.get(user_id)
+                if scrum_master and scrum_master.standup_started:
+                    current_member = scrum_master.team_members_list[scrum_master.current_member_index]
+                    
+                    # Process the user's response
+                    scrum_master.add_user_response(current_member, text)
+                    
+                    # Check if response is complete
+                    is_complete = scrum_master.check_response_completeness(current_member, text)
+                    
+                    if is_complete or text.lower() in ["nothing", "no", "none"]:
+                        # Move to next member or next question
+                        if scrum_master.conversation_step >= 4 or text.lower() in ["nothing", "no", "none"]:
+                            # Thank the current member and move to the next
+                            await turn_context.send_activity(f"Thanks for the update, {current_member}!")
+                            scrum_master.current_member_index += 1
+                            scrum_master.conversation_step = 1
+                            
+                            # Check if we have more members
+                            if scrum_master.current_member_index < len(scrum_master.team_members_list):
+                                next_member = scrum_master.team_members_list[scrum_master.current_member_index]
+                                next_question = scrum_master.generate_question(next_member, 1)
+                                await turn_context.send_activity(f"📋 **Current Member**: {next_member}\n\n{next_question}")
+                            else:
+                                # Standup complete
+                                await turn_context.send_activity("All team members have completed their updates! Use 'get summary' to generate a standup summary.")
+                        else:
+                            # Move to the next question for the current member
+                            scrum_master.conversation_step += 1
+                            next_question = scrum_master.generate_question(
+                                current_member, scrum_master.conversation_step
+                            )
+                            await turn_context.send_activity(next_question)
+                    else:
+                        # Ask a follow-up question
+                        scrum_master.conversation_step += 1
+                        next_question = scrum_master.generate_question(
+                            current_member, scrum_master.conversation_step
+                        )
+                        await turn_context.send_activity(next_question)
+                else:
+                    # No active standup
+                    await turn_context.send_activity("No active standup session. Use 'start standup [board_id]' to begin or 'help' for more commands.")
+        
+    # Process the incoming activity
+    await BOT_ADAPTER.process_activity(activity, "", turn_handler)
+    return {}
+
+# Original REST API endpoints for non-Teams clients
 @app.post("/start_standup/")
 async def start_standup(request: StartStandupRequest):
     user_id = request.user_id
@@ -516,50 +709,55 @@ async def send_message(request: SendMessageRequest):
         member = scrum_master.team_members_list[scrum_master.current_member_index]
         scrum_master.messages.append({"role": "user", "content": message})
         scrum_master.add_user_response(member, message)
-
-        # Check if the response is trivial
-        if message.strip().lower() in ["nothing", "nothing thank you", "no", "none"]:
-            scrum_master.nothing_count += 1
-        else:
-            scrum_master.nothing_count = 0  # Reset if the response is meaningful
-
-        # Use the completeness checker
+        
         is_complete = scrum_master.check_response_completeness(member, message)
-
-        # If the response is complete or repeated "nothing" responses are detected
-        if is_complete or scrum_master.nothing_count >= 2:
-            final_message = f"Thanks for the update, {member}. I'll now move on to the next team member."
-            scrum_master.messages.append({"role": "assistant", "content": final_message})
-            scrum_master.add_assistant_response(final_message)
+        normalized_message = message.strip().lower()
+        
+        if normalized_message in ["nothing", "no", "none"]:
+            # Increment nothing count
+            scrum_master.nothing_count += 1
+            
+            # Move to next member
             scrum_master.current_member_index += 1
             scrum_master.conversation_step = 1
-            scrum_master.messages = []  # Reset messages for the next member
-            scrum_master.nothing_count = 0  # Reset the counter
+            
             if scrum_master.current_member_index < len(scrum_master.team_members_list):
-                next_member = scrum_master.team_members_list[scrum_master.current_member_index]
-                next_question = scrum_master.generate_question(next_member, scrum_master.conversation_step)
-                scrum_master.messages.append({"role": "assistant", "content": next_question})
-                scrum_master.add_assistant_response(next_question)
-                return {"response": "Acknowledged, moving to next member.", "next_question": next_question, "current_member": next_member}
+                return {"message": "Response recorded. Moving to next team member."}
             else:
-                return {"response": "Acknowledged. Standup with all members complete. Use /get_summary."}
+                return {"message": "All team members complete. Use /get_summary to get the standup summary."}
+        
+        if is_complete:
+            if scrum_master.conversation_step >= 4:
+                # All questions completed for this member, move to next member
+                scrum_master.current_member_index += 1
+                scrum_master.conversation_step = 1
+                
+                if scrum_master.current_member_index < len(scrum_master.team_members_list):
+                    return {"message": "Response recorded. Moving to next team member."}
+                else:
+                    return {"message": "All team members complete. Use /get_summary to get the standup summary."}
+            else:
+                # Move to next question for current member
+                scrum_master.conversation_step += 1
+                return {"message": "Response recorded. Moving to next question."}
         else:
-            scrum_master.conversation_step += 1
-            next_question = scrum_master.generate_question(member, scrum_master.conversation_step)
-            scrum_master.messages.append({"role": "assistant", "content": next_question})
-            scrum_master.add_assistant_response(next_question)
-            return {"response": "Acknowledged.", "next_question": next_question}
-    else:
-        return {"message": "Standup with all members complete. Use /get_summary."}
+            # Need more information, stay on the same question
+            return {"message": "Response recorded. Please provide more details."}
 
 @app.get("/get_summary/{user_id}")
 async def get_summary(user_id: str):
     scrum_master = standup_sessions.get(user_id)
     if not scrum_master:
-        raise HTTPException(status_code=404, detail="User session not found.")
+        raise HTTPException(status_code=400, detail="User not found or standup not started.")
+    
     summary = scrum_master.generate_summary()
-    blockers = [msg['content'] for msg in scrum_master.conversation_history if "blocker" in msg['content'].lower()]
-    action_items = [msg['content'] for msg in scrum_master.conversation_history if "action item" in msg['content'].lower()]
+    
+    # Store the complete conversation in MongoDB
+    blockers = [msg['content'] for msg in scrum_master.conversation_history 
+               if "blocker" in msg['content'].lower()]
+    action_items = [msg['content'] for msg in scrum_master.conversation_history 
+                   if "action item" in msg['content'].lower()]
+    
     conversation_doc = {
         "user_id": user_id,
         "messages": scrum_master.conversation_history,
@@ -568,15 +766,94 @@ async def get_summary(user_id: str):
         "summary": summary
     }
     store_conversation(conversation_doc)
-    scrum_master.standup_started = False
-    del standup_sessions[user_id]
-    return {"summary": summary, "blockers": blockers, "action_items": action_items, "message": "Standup ended."}
+    
+    # Clean up the session
+    standup_sessions[user_id].standup_started = False
+    
+    return {"summary": summary}
 
 @app.get("/get_boards/")
 async def fetch_jira_boards():
-    return get_boards()
+    try:
+        boards = get_boards()
+        return {"boards": boards}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/get_sprints/{board_id}")
 async def fetch_jira_sprints(board_id: int):
-    return fetch_sprint_details(board_id)
-                
+    try:
+        sprints = fetch_sprint_details(board_id)
+        return {"sprints": sprints}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/get_standup_state/{user_id}")
+async def get_standup_state(user_id: str):
+    scrum_master = standup_sessions.get(user_id)
+    if not scrum_master:
+        raise HTTPException(status_code=400, detail="User not found or standup not started.")
+    
+    return StandupState(
+        user_id=user_id,
+        current_member_index=scrum_master.current_member_index,
+        conversation_step=scrum_master.conversation_step,
+        messages=scrum_master.messages,
+        standup_started=scrum_master.standup_started,
+        team_members_list=scrum_master.team_members_list,
+        nothing_count=scrum_master.nothing_count
+    )
+
+@app.post("/schedule_standup/")
+async def schedule_standup(board_id: int, user_id: str, time: str):
+    """Schedule a standup for a specific time (format: HH:MM)."""
+    # This would likely use a task scheduler like APScheduler or Celery
+    # For demonstration, we'll just validate inputs
+    try:
+        hours, minutes = map(int, time.split(':'))
+        if not (0 <= hours < 24 and 0 <= minutes < 60):
+            raise ValueError("Invalid time format")
+        
+        # Here you would add the scheduling logic
+        return {"message": f"Standup scheduled for {time} for board {board_id}"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error scheduling standup: {str(e)}")
+
+@app.get("/get_historical_standups/{user_id}")
+async def get_historical_standups(user_id: str, limit: int = 5):
+    """Retrieve historical standup summaries for a user."""
+    try:
+        standups = get_previous_standups(user_id, limit)
+        return {"historical_standups": standups}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving historical standups: {str(e)}")
+
+@app.post("/clear_standup_session/{user_id}")
+async def clear_standup_session(user_id: str):
+    """Clear a user's active standup session."""
+    if user_id in standup_sessions:
+        del standup_sessions[user_id]
+        return {"message": "Standup session cleared successfully."}
+    else:
+        raise HTTPException(status_code=404, detail="No active standup session found for this user.")
+
+# --------------------------------------------------------------------------------
+# 7) Main Application Entry Point
+# --------------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    
+    # Create indexes for MongoDB collections
+    try:
+        boards_collection.create_index("board_id", unique=True)
+        sprints_collection.create_index("sprint_id", unique=True)
+        issues_collection.create_index("issue_id", unique=True)
+        users_collection.create_index("user_id", unique=True)
+        teams_users_collection.create_index("teams_user_id", unique=True)
+    except Exception as e:
+        print(f"Error creating MongoDB indexes: {e}")
+    
+    print("Starting AI Scrum Master Application...")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+    
+    
