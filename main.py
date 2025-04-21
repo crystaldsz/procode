@@ -39,8 +39,8 @@ genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel('gemini-2.0-flash')
 
 # Bot Framework Configuration
-BOT_APP_ID = os.getenv("MicrosoftAppId", "3a62a6ac-053d-4cb7-8781-4786a695705b")  # Replace with your actual App ID
-BOT_APP_PASSWORD = os.getenv("MicrosoftAppPassword", "")  # Replace with your actual App Password
+BOT_APP_ID = os.getenv("MicrosoftAppId")  # Replace with your actual App ID
+BOT_APP_PASSWORD = os.getenv("MicrosoftAppPassword")  # Replace with your actual App Password
 
 # Configure Bot Framework adapter
 BOT_SETTINGS = BotFrameworkAdapterSettings(BOT_APP_ID, BOT_APP_PASSWORD)
